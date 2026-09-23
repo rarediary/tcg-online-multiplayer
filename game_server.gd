@@ -24,6 +24,7 @@ var game_over := false
 var winner_side := -1
 var next_network_id := 1
 var ready_peers: Dictionary = {}
+var scheduled_summons: Array = [[], []]
 var pending_choice_token := 0
 var pending_choice_peer := 0
 var next_choice_token := 1
@@ -203,6 +204,7 @@ func _request_network_end_turn() -> void:
 		if state is Dictionary:
 			state["summoned_this_turn"] = false
 			state["attack_ready"] = int(state.get("current_attack", 0)) > 0
+	_resolve_scheduled_summons(active_side)
 	_broadcast_snapshot()
 
 
@@ -300,7 +302,61 @@ func _resolve_spell(side: int, state: Dictionary) -> bool:
 		"draw":
 			for i in range(maxi(0, int(data.get("amount", 0)))):
 				_draw_card(side)
+		"summon":
+			if str(data.get("timing", "immediate")) == "start_next_turn":
+				scheduled_summons[side].append(data.duplicate(true))
+			else:
+				_summon_from_effect(side, data)
 	return false
+
+
+func _summon_definition(effect_data: Dictionary) -> Dictionary:
+	var record_value = effect_data.get("summon_card", {})
+	if record_value is Dictionary and not (record_value as Dictionary).is_empty():
+		return (record_value as Dictionary).duplicate(true)
+
+	var summon_id := str(effect_data.get("summon_card_id", ""))
+	if summon_id.is_empty():
+		return {}
+
+	for side in [0, 1]:
+		for definition_value in decks[side]:
+			if definition_value is Dictionary and str(definition_value.get("card_id", "")) == summon_id:
+				return (definition_value as Dictionary).duplicate(true)
+		for state_value in hands[side]:
+			if state_value is Dictionary:
+				var definition: Dictionary = _definition(state_value as Dictionary)
+				if str(definition.get("card_id", "")) == summon_id:
+					return definition.duplicate(true)
+		for state_value in boards[side]:
+			if state_value is Dictionary:
+				var definition: Dictionary = _definition(state_value as Dictionary)
+				if str(definition.get("card_id", "")) == summon_id:
+					return definition.duplicate(true)
+	return {}
+
+
+func _summon_from_effect(side: int, effect_data: Dictionary) -> void:
+	if side < 0 or side > 1:
+		return
+	var definition: Dictionary = _summon_definition(effect_data)
+	if definition.is_empty() or int(definition.get("card_type", 0)) == 1:
+		return
+	var count: int = clampi(int(effect_data.get("summon_count", 1)), 1, BOARD_LIMIT)
+	for i in range(count):
+		if boards[side].size() >= BOARD_LIMIT:
+			break
+		boards[side].append(_new_card_state(definition))
+
+
+func _resolve_scheduled_summons(side: int) -> void:
+	if side < 0 or side > 1:
+		return
+	var pending: Array = scheduled_summons[side].duplicate(true)
+	scheduled_summons[side].clear()
+	for value in pending:
+		if value is Dictionary:
+			_summon_from_effect(side, value as Dictionary)
 
 
 func _custom_spell_multiplier(side: int, target_type: String, target: Dictionary, scaling: String) -> int:
