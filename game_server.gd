@@ -248,8 +248,38 @@ func _request_network_play_card(network_id: int, insertion_index: int) -> void:
 		boards[side].insert(insert_at, state)
 		var played_definition: Dictionary = _definition(state)
 		if str(played_definition.get("effect_id", "")) == CUSTOM_MINION_EFFECT:
-			await _resolve_custom_minion_battlecry(side, state)
+			await _resolve_custom_minion_trigger(side, state, "battlecry")
 	_broadcast_snapshot()
+
+
+func _custom_effects(data: Dictionary, default_trigger: String) -> Array:
+	var result: Array = []
+	var values = data.get("effects", [])
+	if values is Array:
+		for value in values:
+			if value is Dictionary:
+				var effect: Dictionary = (value as Dictionary).duplicate(true)
+				if not effect.has("trigger"):
+					effect["trigger"] = default_trigger
+				result.append(effect)
+	if result.is_empty() and not str(data.get("effect", "")).is_empty():
+		var legacy: Dictionary = data.duplicate(true)
+		legacy.erase("effects")
+		if not legacy.has("trigger"):
+			legacy["trigger"] = default_trigger
+		result.append(legacy)
+	return result
+
+
+func _effects_for_trigger(definition: Dictionary, trigger: String) -> Array:
+	var result: Array = []
+	var data_value = definition.get("effect_data", {})
+	var data: Dictionary = data_value if data_value is Dictionary else {}
+	var default_trigger := "cast" if int(definition.get("card_type", 0)) == 1 else "battlecry"
+	for value in _custom_effects(data, default_trigger):
+		if value is Dictionary and str((value as Dictionary).get("trigger", default_trigger)) == trigger:
+			result.append((value as Dictionary).duplicate(true))
+	return result
 
 
 func _passes_state_filter(state: Dictionary, data: Dictionary) -> bool:
@@ -357,8 +387,8 @@ func _apply_custom_effect(side: int, data: Dictionary, targets: Array) -> void:
 					target["max_health"] = int(target.get("max_health", 1)) + hp
 					target["current_health"] = int(target.get("current_health", 1)) + hp
 					_apply_state_keyword_modifier(target, data)
-			_resolve_deaths(side)
-			_resolve_deaths(1 - side)
+			await _resolve_deaths(side)
+			await _resolve_deaths(1 - side)
 
 		"set_stats":
 			for value in targets:
@@ -380,8 +410,8 @@ func _apply_custom_effect(side: int, data: Dictionary, targets: Array) -> void:
 			for value in targets:
 				if value is Dictionary:
 					_take_damage(value as Dictionary, amount)
-			_resolve_deaths(side)
-			_resolve_deaths(1 - side)
+			await _resolve_deaths(side)
+			await _resolve_deaths(1 - side)
 
 		"heal":
 			var amount := maxi(0, int(data.get("amount", 0)) * multiplier)
@@ -404,35 +434,31 @@ func _apply_custom_effect(side: int, data: Dictionary, targets: Array) -> void:
 				_summon_from_effect(side, data)
 
 
-func _resolve_custom_minion_battlecry(side: int, state: Dictionary) -> void:
+func _resolve_custom_minion_trigger(side: int, state: Dictionary, trigger: String) -> void:
 	var definition: Dictionary = _definition(state)
-	var data_value = definition.get("effect_data", {})
-	var data: Dictionary = data_value if data_value is Dictionary else {}
-	var target_type := str(data.get("target", "none"))
-
-	if target_type == "none":
-		_apply_custom_effect(side, data, [])
-		return
-
-	var candidates: Array = _target_states(side, state, data)
-	if candidates.is_empty():
-		return
-
-	var targets: Array = []
-	if _target_uses_choice(target_type):
-		var choice: int = await _request_remote_choice(
-			side,
-			str(definition.get("card_name", "Choose a target")),
-			candidates,
-			false
-		)
-		if choice < 0 or choice >= candidates.size():
-			return
-		targets = [candidates[choice]]
-	else:
-		targets = candidates
-
-	_apply_custom_effect(side, data, targets)
+	for value in _effects_for_trigger(definition, trigger):
+		if not value is Dictionary:
+			continue
+		var data: Dictionary = value as Dictionary
+		var target_type := str(data.get("target", "none"))
+		var targets: Array = []
+		if target_type != "none":
+			var candidates: Array = _target_states(side, state, data)
+			if _target_uses_choice(target_type):
+				if candidates.is_empty():
+					continue
+				var choice: int = await _request_remote_choice(
+					side,
+					str(definition.get("card_name", "Choose a target")),
+					candidates,
+					false
+				)
+				if choice < 0 or choice >= candidates.size():
+					continue
+				targets = [candidates[choice]]
+			else:
+				targets = candidates
+		await _apply_custom_effect(side, data, targets)
 
 
 func _resolve_spell(side: int, state: Dictionary) -> bool:
@@ -443,34 +469,45 @@ func _resolve_spell(side: int, state: Dictionary) -> bool:
 	if str(definition.get("effect_id", "")) != "custom_spell":
 		return false
 
-	var data_value = definition.get("effect_data", {})
-	var data: Dictionary = data_value if data_value is Dictionary else {}
-	var target_type := str(data.get("target", "none"))
-
-	if target_type == "none":
-		_apply_custom_effect(side, data, [])
+	var effects: Array = _effects_for_trigger(definition, "cast")
+	if effects.is_empty():
 		return false
 
-	var candidates: Array = _target_states(side, {}, data)
-	if candidates.is_empty():
-		return true
+	var target_sets: Array = []
+	for value in effects:
+		if not value is Dictionary:
+			target_sets.append([])
+			continue
+		var data: Dictionary = value as Dictionary
+		var target_type := str(data.get("target", "none"))
+		if target_type == "none":
+			target_sets.append([])
+			continue
+		var candidates: Array = _target_states(side, {}, data)
+		if _target_uses_choice(target_type):
+			if candidates.is_empty():
+				return true
+			var choice: int = await _request_remote_choice(
+				side,
+				str(definition.get("card_name", "Choose a target")),
+				candidates,
+				true
+			)
+			if choice < 0 or choice >= candidates.size():
+				return true
+			target_sets.append([candidates[choice]])
+		else:
+			target_sets.append(candidates)
 
-	var targets: Array = []
-	if _target_uses_choice(target_type):
-		var choice: int = await _request_remote_choice(
-			side,
-			str(definition.get("card_name", "Choose a target")),
-			candidates,
-			true
-		)
-		if choice < 0 or choice >= candidates.size():
-			return true
-		targets = [candidates[choice]]
-	else:
-		targets = candidates
-
-	_apply_custom_effect(side, data, targets)
+	for i in range(effects.size()):
+		if not effects[i] is Dictionary:
+			continue
+		var targets: Array = []
+		if i < target_sets.size() and target_sets[i] is Array:
+			targets = target_sets[i] as Array
+		await _apply_custom_effect(side, effects[i] as Dictionary, targets)
 	return false
+
 
 func _summon_definition(effect_data: Dictionary) -> Dictionary:
 	var record_value = effect_data.get("summon_card", {})
@@ -598,8 +635,8 @@ func _request_network_attack(source_id: int, target_id: int, target_is_hero: boo
 	var incoming := maxi(0, int(target.get("current_attack", 0))) + int(source.get("attack_vulnerability", 0))
 	_take_damage(target, outgoing)
 	_take_damage(source, incoming)
-	_resolve_deaths(side)
-	_resolve_deaths(defender_side)
+	await _resolve_deaths(side)
+	await _resolve_deaths(defender_side)
 	_broadcast_snapshot()
 
 
@@ -613,12 +650,22 @@ func _take_damage(state: Dictionary, amount: int) -> void:
 
 
 func _resolve_deaths(side: int) -> void:
+	var dead: Array = []
 	for i in range(boards[side].size() - 1, -1, -1):
 		var state = boards[side][i]
 		if state is Dictionary and int(state.get("current_health", 0)) <= 0:
+			dead.append(state)
 			fallen[side].append(_definition(state).duplicate(true))
 			discard_count += 1
 			boards[side].remove_at(i)
+
+	for value in dead:
+		if not value is Dictionary:
+			continue
+		var state: Dictionary = value as Dictionary
+		var definition: Dictionary = _definition(state)
+		if str(definition.get("effect_id", "")) == CUSTOM_MINION_EFFECT:
+			await _resolve_custom_minion_trigger(side, state, "deathrattle")
 
 
 func _broadcast_snapshot() -> void:
