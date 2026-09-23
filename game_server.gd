@@ -7,6 +7,7 @@ const HAND_LIMIT := 10
 const BOARD_LIMIT := 7
 const MANA_CAP := 10
 const STARTING_HEALTH := 30
+const CUSTOM_MINION_EFFECT := "custom_minion"
 
 var decks: Array = [[], []]
 var hands: Array = [[], []]
@@ -245,70 +246,231 @@ func _request_network_play_card(network_id: int, insertion_index: int) -> void:
 		state["attack_ready"] = false
 		var insert_at := clampi(insertion_index, 0, boards[side].size())
 		boards[side].insert(insert_at, state)
+		var played_definition: Dictionary = _definition(state)
+		if str(played_definition.get("effect_id", "")) == CUSTOM_MINION_EFFECT:
+			await _resolve_custom_minion_battlecry(side, state)
 	_broadcast_snapshot()
 
 
-func _resolve_spell(side: int, state: Dictionary) -> bool:
-	var definition := _definition(state)
-	if bool(definition.get("is_coin", false)):
-		mana[side] = mini(MANA_CAP, mana[side] + 1)
-		return false
-	if str(definition.get("effect_id", "")) != "custom_spell":
-		return false
-	var data_value = definition.get("effect_data", {})
-	var data: Dictionary = data_value if data_value is Dictionary else {}
-	var effect_kind := str(data.get("effect", ""))
+func _passes_state_filter(state: Dictionary, data: Dictionary) -> bool:
+	var stat := str(data.get("filter_stat", "none"))
+	if stat == "none":
+		return true
+
+	var value: int = int(state.get("current_attack", 0)) if stat == "attack" else int(state.get("current_health", 0))
+	var threshold := int(data.get("filter_value", 0))
+	match str(data.get("filter_compare", "less_than")):
+		"less_than": return value < threshold
+		"at_most": return value <= threshold
+		"equal": return value == threshold
+		"at_least": return value >= threshold
+		"greater_than": return value > threshold
+	return true
+
+
+func _target_states(side: int, source_state: Dictionary, data: Dictionary) -> Array:
 	var target_type := str(data.get("target", "none"))
-	var target_side := side
 	var candidates: Array = []
-	if target_type == "friendly_minion":
-		target_side = side
-		candidates = boards[side].duplicate()
-	elif target_type == "enemy_minion":
-		target_side = 1 - side
-		for candidate in boards[target_side]:
-			if candidate is Dictionary and _visible_target(candidate):
-				candidates.append(candidate)
 
-	var target: Dictionary = {}
-	if target_type != "none":
-		if candidates.is_empty():
-			return true
-		var choice := await _request_remote_choice(side, str(definition.get("card_name", "Choose a target")), candidates, true)
-		if choice < 0 or choice >= candidates.size():
-			return true
-		target = candidates[choice]
+	match target_type:
+		"friendly_minion", "all_friendly_minions":
+			candidates = boards[side].duplicate()
+		"all_other_friendly_minions":
+			for value in boards[side]:
+				if value is Dictionary:
+					var candidate: Dictionary = value as Dictionary
+					if int(candidate.get("network_id", 0)) != int(source_state.get("network_id", -1)):
+						candidates.append(candidate)
+		"enemy_minion":
+			for value in boards[1 - side]:
+				if value is Dictionary:
+					var candidate: Dictionary = value as Dictionary
+					if _visible_target(candidate):
+						candidates.append(candidate)
+		"all_enemy_minions":
+			candidates = boards[1 - side].duplicate()
+		"self":
+			if not source_state.is_empty():
+				candidates = [source_state]
+		_:
+			return []
 
-	var multiplier := _custom_spell_multiplier(side, target_type, target, str(data.get("scaling", "none")))
+	var filtered: Array = []
+	for value in candidates:
+		if value is Dictionary:
+			var candidate: Dictionary = value as Dictionary
+			if int(candidate.get("current_health", 0)) > 0 and _passes_state_filter(candidate, data):
+				filtered.append(candidate)
+	return filtered
+
+
+func _target_uses_choice(target_type: String) -> bool:
+	return target_type in ["friendly_minion", "enemy_minion"]
+
+
+func _grant_state_keyword(state: Dictionary, keyword: String) -> void:
+	var normalized := keyword.strip_edges().to_lower()
+	if normalized.is_empty():
+		return
+
+	var runtime_value = state.get("runtime_keywords", [])
+	var runtime: Array = runtime_value if runtime_value is Array else []
+	if not runtime.has(normalized):
+		runtime.append(normalized)
+	state["runtime_keywords"] = runtime
+
+	if normalized == "divine_shield":
+		state["divine_shield_active"] = true
+	elif normalized == "stealth":
+		state["stealth_active"] = true
+
+
+func _custom_effect_multiplier(side: int, scaling: String) -> int:
+	match scaling:
+		"other_friendly_minions":
+			return maxi(0, boards[side].size() - 1)
+		"friendly_minions":
+			return boards[side].size()
+		"enemy_minions":
+			return boards[1 - side].size()
+	return 1
+
+
+func _apply_state_keyword_modifier(state: Dictionary, data: Dictionary) -> void:
+	var keyword := str(data.get("keyword", ""))
+	if not keyword.is_empty() and int(state.get("current_health", 0)) > 0:
+		_grant_state_keyword(state, keyword)
+
+
+func _apply_custom_effect(side: int, data: Dictionary, targets: Array) -> void:
+	var effect_kind := str(data.get("effect", ""))
+	var multiplier: int = _custom_effect_multiplier(side, str(data.get("scaling", "none")))
+
 	match effect_kind:
 		"buff":
-			if target.is_empty():
-				return true
-			var atk := int(data.get("attack", 0)) * multiplier
-			var hp := int(data.get("health", 0)) * multiplier
-			target["current_attack"] = int(target.get("current_attack", 0)) + atk
-			target["max_health"] = int(target.get("max_health", 1)) + hp
-			target["current_health"] = int(target.get("current_health", 1)) + hp
+			for value in targets:
+				if value is Dictionary:
+					var target: Dictionary = value as Dictionary
+					var atk := int(data.get("attack", 0)) * multiplier
+					var hp := int(data.get("health", 0)) * multiplier
+					target["current_attack"] = int(target.get("current_attack", 0)) + atk
+					target["max_health"] = int(target.get("max_health", 1)) + hp
+					target["current_health"] = int(target.get("current_health", 1)) + hp
+					_apply_state_keyword_modifier(target, data)
+			_resolve_deaths(side)
+			_resolve_deaths(1 - side)
+
+		"set_stats":
+			for value in targets:
+				if value is Dictionary:
+					var target: Dictionary = value as Dictionary
+					target["current_attack"] = int(data.get("attack", 0))
+					target["max_health"] = maxi(1, int(data.get("health", 1)))
+					target["current_health"] = target["max_health"]
+					target["temporary_attack"] = 0
+					_apply_state_keyword_modifier(target, data)
+
+		"keyword":
+			for value in targets:
+				if value is Dictionary:
+					_apply_state_keyword_modifier(value as Dictionary, data)
+
 		"damage":
-			if target.is_empty():
-				return true
-			_take_damage(target, maxi(0, int(data.get("amount", 0)) * multiplier))
-			_resolve_deaths(target_side)
-		"heal":
-			if target.is_empty():
-				return true
 			var amount := maxi(0, int(data.get("amount", 0)) * multiplier)
-			target["current_health"] = mini(int(target.get("max_health", 1)), int(target.get("current_health", 1)) + amount)
+			for value in targets:
+				if value is Dictionary:
+					_take_damage(value as Dictionary, amount)
+			_resolve_deaths(side)
+			_resolve_deaths(1 - side)
+
+		"heal":
+			var amount := maxi(0, int(data.get("amount", 0)) * multiplier)
+			for value in targets:
+				if value is Dictionary:
+					var target: Dictionary = value as Dictionary
+					target["current_health"] = mini(
+						int(target.get("max_health", 1)),
+						int(target.get("current_health", 1)) + amount
+					)
+
 		"draw":
 			for i in range(maxi(0, int(data.get("amount", 0)))):
 				_draw_card(side)
+
 		"summon":
 			if str(data.get("timing", "immediate")) == "start_next_turn":
 				scheduled_summons[side].append(data.duplicate(true))
 			else:
 				_summon_from_effect(side, data)
-	return false
 
+
+func _resolve_custom_minion_battlecry(side: int, state: Dictionary) -> void:
+	var definition: Dictionary = _definition(state)
+	var data_value = definition.get("effect_data", {})
+	var data: Dictionary = data_value if data_value is Dictionary else {}
+	var target_type := str(data.get("target", "none"))
+
+	if target_type == "none":
+		_apply_custom_effect(side, data, [])
+		return
+
+	var candidates: Array = _target_states(side, state, data)
+	if candidates.is_empty():
+		return
+
+	var targets: Array = []
+	if _target_uses_choice(target_type):
+		var choice: int = await _request_remote_choice(
+			side,
+			str(definition.get("card_name", "Choose a target")),
+			candidates,
+			false
+		)
+		if choice < 0 or choice >= candidates.size():
+			return
+		targets = [candidates[choice]]
+	else:
+		targets = candidates
+
+	_apply_custom_effect(side, data, targets)
+
+
+func _resolve_spell(side: int, state: Dictionary) -> bool:
+	var definition: Dictionary = _definition(state)
+	if bool(definition.get("is_coin", false)):
+		mana[side] = mini(MANA_CAP, mana[side] + 1)
+		return false
+	if str(definition.get("effect_id", "")) != "custom_spell":
+		return false
+
+	var data_value = definition.get("effect_data", {})
+	var data: Dictionary = data_value if data_value is Dictionary else {}
+	var target_type := str(data.get("target", "none"))
+
+	if target_type == "none":
+		_apply_custom_effect(side, data, [])
+		return false
+
+	var candidates: Array = _target_states(side, {}, data)
+	if candidates.is_empty():
+		return true
+
+	var targets: Array = []
+	if _target_uses_choice(target_type):
+		var choice: int = await _request_remote_choice(
+			side,
+			str(definition.get("card_name", "Choose a target")),
+			candidates,
+			true
+		)
+		if choice < 0 or choice >= candidates.size():
+			return true
+		targets = [candidates[choice]]
+	else:
+		targets = candidates
+
+	_apply_custom_effect(side, data, targets)
+	return false
 
 func _summon_definition(effect_data: Dictionary) -> Dictionary:
 	var record_value = effect_data.get("summon_card", {})
@@ -357,20 +519,6 @@ func _resolve_scheduled_summons(side: int) -> void:
 	for value in pending:
 		if value is Dictionary:
 			_summon_from_effect(side, value as Dictionary)
-
-
-func _custom_spell_multiplier(side: int, target_type: String, target: Dictionary, scaling: String) -> int:
-	match scaling:
-		"other_friendly_minions":
-			var count: int = boards[side].size()
-			if target_type == "friendly_minion" and not target.is_empty():
-				count -= 1
-			return maxi(0, count)
-		"friendly_minions":
-			return boards[side].size()
-		"enemy_minions":
-			return boards[1 - side].size()
-	return 1
 
 
 func _request_remote_choice(side: int, prompt: String, options: Array, cancellable: bool) -> int:
