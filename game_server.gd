@@ -306,7 +306,7 @@ func _resolve_spell(side: int, state: Dictionary) -> bool:
 func _custom_spell_multiplier(side: int, target_type: String, target: Dictionary, scaling: String) -> int:
 	match scaling:
 		"other_friendly_minions":
-			var count := boards[side].size()
+			var count: int = boards[side].size()
 			if target_type == "friendly_minion" and not target.is_empty():
 				count -= 1
 			return maxi(0, count)
