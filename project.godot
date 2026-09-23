@@ -1,0 +1,12 @@
+config_version=5
+
+[application]
+config/name="TCG Dedicated Multiplayer Server"
+run/main_scene="res://server_game.tscn"
+config/features=PackedStringArray("4.7")
+
+[autoload]
+NetworkSession="*res://network_session.gd"
+
+[network]
+limits/debugger/max_queued_messages=1024
