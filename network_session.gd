@@ -5,6 +5,9 @@ signal session_ended(message: String)
 enum Mode { OFFLINE, CLIENT, SERVER }
 
 const DEFAULT_SERVER_PORT := 10000
+const Catalog = preload("res://catalog_store.gd")
+const CATALOG_HELLO := "TCG_CATALOG_V1:"
+
 const GAME_SCENE := "res://server_game.tscn"
 
 var mode: Mode = Mode.OFFLINE
@@ -45,6 +48,9 @@ func is_client() -> bool:
 
 
 func start_dedicated_server(port: int = DEFAULT_SERVER_PORT) -> Error:
+	if not Catalog.load_catalog():
+		push_error(Catalog.error_message)
+		return ERR_INVALID_DATA
 	_reset_server_match_state()
 	var peer := WebSocketMultiplayerPeer.new()
 	var error := peer.create_server(port, "0.0.0.0")
@@ -77,6 +83,7 @@ func deck_records_for_side(side: int) -> Array:
 
 
 func _on_peer_connected(id: int) -> void:
+	_lobby_status.rpc_id(id, CATALOG_HELLO + Catalog.version)
 	print("Player peer %d connected." % id)
 
 
@@ -107,18 +114,11 @@ func _submit_client_deck(records: Array) -> void:
 		_reject_match.rpc_id(sender, "A match is already in progress. Try again shortly.")
 		return
 
-	var clean_records: Array = []
-	for value in records:
-		if value is Dictionary:
-			var record := (value as Dictionary).duplicate(true)
-			if str(record.get("card_name", "")).is_empty():
-				continue
-			clean_records.append(record)
-			if clean_records.size() >= 30:
-				break
-	if clean_records.size() < 5:
-		_reject_match.rpc_id(sender, "Your deck has fewer than 5 cards.")
+	var validated := Catalog.validate_deck(records)
+	if not str(validated.error).is_empty():
+		_reject_match.rpc_id(sender, str(validated.error))
 		return
+	var clean_records: Array = validated.records
 
 	var side := side_for_peer(sender)
 	if side < 0:
@@ -220,3 +220,4 @@ func _clear_server_side(side: int) -> void:
 
 func _server_is_in_game_scene() -> bool:
 	return get_tree().current_scene != null and get_tree().current_scene.scene_file_path == GAME_SCENE
+
