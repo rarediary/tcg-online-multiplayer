@@ -510,29 +510,10 @@ func _resolve_spell(side: int, state: Dictionary) -> bool:
 
 
 func _summon_definition(effect_data: Dictionary) -> Dictionary:
-	var record_value = effect_data.get("summon_card", {})
-	if record_value is Dictionary and not (record_value as Dictionary).is_empty():
-		return (record_value as Dictionary).duplicate(true)
-
-	var summon_id := str(effect_data.get("summon_card_id", ""))
-	if summon_id.is_empty():
-		return {}
-
-	for side in [0, 1]:
-		for definition_value in decks[side]:
-			if definition_value is Dictionary and str(definition_value.get("card_id", "")) == summon_id:
-				return (definition_value as Dictionary).duplicate(true)
-		for state_value in hands[side]:
-			if state_value is Dictionary:
-				var definition: Dictionary = _definition(state_value as Dictionary)
-				if str(definition.get("card_id", "")) == summon_id:
-					return definition.duplicate(true)
-		for state_value in boards[side]:
-			if state_value is Dictionary:
-				var definition: Dictionary = _definition(state_value as Dictionary)
-				if str(definition.get("card_id", "")) == summon_id:
-					return definition.duplicate(true)
-	return {}
+	# Resolve every summon against the release, including tokens outside decks.
+	# Embedded historical copies must not override current balance changes.
+	var id := str(effect_data.get("summon_card_id", ""))
+	return preload("res://catalog_store.gd").get_card(id)
 
 
 func _summon_from_effect(side: int, effect_data: Dictionary) -> void:
@@ -704,3 +685,4 @@ func _snapshot_for_side(side: int) -> Dictionary:
 @rpc("authority", "call_remote", "reliable")
 func _apply_network_snapshot(_snapshot: Dictionary) -> void:
 	pass
+
